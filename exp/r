@@ -1,0 +1,7 @@
+#!/bin/bash
+
+set -e
+
+rm -f rec.aiff
+
+sudo timeout 60 ./pokus
