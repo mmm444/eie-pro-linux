@@ -31,6 +31,12 @@ static struct usb_driver eie_driver;
 #define BYTES_PER_FRAME 12
 #define BYTES_PER_FRAME_CAP 16
 
+/*
+ TODO: redefine states & respect the close command again
+ TODO: fix opening of 2nd stream to be limited to the rate of the 1st
+ TODO: correctly handle xruns
+*/
+
 enum {
 	PLAYBACK_RUNNING,
 	CAPTURE_RUNNING,
@@ -684,6 +690,8 @@ static void cap_urb_complete(struct urb *urb)
 			eie->cap_buf_pos++;
 			eie->cap_buf_pos %= runtime->buffer_size;
 
+			/* TODO: this is broken: negative shifts are undefined in C */
+			/* TODO: calculate in platform order & convert to LE once */
 			out[0] = 0;
 			out[1] = 0;
 			out[2] = 0;
@@ -799,7 +807,7 @@ static int eie_probe(struct usb_interface *interface,
 		mutex_unlock(&devices_mutex);
 		return -ENOENT;
 	}
-	err = snd_card_create(index[card_index], id[card_index], THIS_MODULE,
+	err = snd_card_new(&interface_to_usbdev(interface)->dev, index[card_index], id[card_index], THIS_MODULE,
 			      sizeof(*eie), &card);
 	if (err < 0) {
 		mutex_unlock(&devices_mutex);
