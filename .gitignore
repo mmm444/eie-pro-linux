@@ -1,6 +1,10 @@
 *.o
 *.ko
 *.mod.*
+*o.cmd
 Module.symvers
 modules.order
+.tmp_versions/
+.tags*
 exp/pokus
+exp/rec.*
