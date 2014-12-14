@@ -7,6 +7,7 @@
 #include <sound/initval.h>
 #include <sound/pcm.h>
 #include <sound/pcm_params.h>
+#include <sound/rawmidi.h>
 
 MODULE_DESCRIPTION("Akai EIE pro driver");
 MODULE_AUTHOR("Michal Rydlo <michal.rydlo@gmail.com>");
@@ -28,6 +29,9 @@ static struct usb_driver eie_driver;
 
 #define CAP_URB_CNT 2
 
+#define MIN_URB_CNT 2
+#define MOUT_URB_CNT 2
+
 #define BYTES_PER_FRAME 12
 #define BYTES_PER_FRAME_CAP 16
 
@@ -41,7 +45,9 @@ enum {
 	PLAYBACK_RUNNING,
 	CAPTURE_RUNNING,
 	URBS_FLOWING,
-	DISCONNECTED /* TODO use */
+	DISCONNECTED, /* TODO use */
+	MIN_OPEN,
+	MIN_UP
 };
 
 struct eie_playback_urb {
@@ -89,6 +95,14 @@ struct eie {
 	spinlock_t lock;
 
 	unsigned long states;
+
+	struct snd_rawmidi *rmidi;
+	__u8 min_endpointAddr;
+	__u8 mout_endpointAddr;
+	struct urb *min_urbs[MIN_URB_CNT];
+	struct urb *mout_urbs[MOUT_URB_CNT];
+	struct snd_rawmidi_substream *min_substream;
+	struct snd_rawmidi_substream *mout_substream;
 };
 
 static struct snd_pcm_hardware eie_playback_hw = {
@@ -128,7 +142,7 @@ static int eie_set_alt_setting(struct eie *eie)
 
 static int eie_setup_hw(struct snd_pcm_substream *substream)
 {
-	struct eie *eie = substream->private_data;
+	//struct eie *eie = substream->private_data;
 	int err;
 
 	/* TODO: determine possible HW params from runnnig streams. */
@@ -536,6 +550,76 @@ static snd_pcm_uframes_t eie_cpcm_pointer(struct snd_pcm_substream *substream)
 	return pos;
 }
 
+
+static int eie_min_open(struct snd_rawmidi_substream *substream)
+{
+	int i, err;
+	struct eie *eie = substream->rmidi->private_data;
+
+	if (test_bit(MIN_OPEN, &eie->states))
+		return -EINVAL;
+
+	for (i = 0; i < MIN_URB_CNT; i++) {
+		err = usb_submit_urb(eie->min_urbs[i], GFP_KERNEL);
+		if (err < 0)
+			goto err;
+	}
+	set_bit(MIN_OPEN, &eie->states);
+	eie->min_substream = substream;
+	return 0;
+
+err:
+	for (i = 0; i < MIN_URB_CNT; i++)
+		usb_kill_urb(eie->min_urbs[i]);
+	dev_dbg(&eie->udev->dev, "Urb problem: %s", usb_error_string(err));
+
+	return err;
+}
+
+static int eie_min_close(struct snd_rawmidi_substream *substream)
+{
+	int i;
+	struct eie *eie = substream->rmidi->private_data;
+
+	dev_dbg(&eie->udev->dev, "Closing!");
+	for (i = 0; i < MIN_URB_CNT; i++)
+		usb_kill_urb(eie->min_urbs[i]);
+
+	clear_bit(MIN_OPEN, &eie->states);
+	clear_bit(MIN_UP, &eie->states);
+	eie->min_substream = NULL;
+	return 0;
+}
+
+static void eie_min_trigger(struct snd_rawmidi_substream *substream, int up)
+{
+	struct eie *eie = substream->rmidi->private_data;
+
+	if (test_bit(MIN_OPEN, &eie->states)) {
+		if (up)
+			set_bit(MIN_UP, &eie->states);
+		else
+			clear_bit(MIN_UP, &eie->states);
+	}
+}
+
+static int eie_mout_open(struct snd_rawmidi_substream *substream)
+{
+	// struct eie *eie = substream->rmidi->private_data;
+	return 0;
+}
+
+static int eie_mout_close(struct snd_rawmidi_substream *substream)
+{
+	// struct eie *eie = substream->rmidi->private_data;
+	return 0;
+}
+
+static void eie_mout_trigger(struct snd_rawmidi_substream *substream, int up)
+{
+	// struct eie *eie = substream->rmidi->private_data;
+}
+
 static struct snd_pcm_ops eie_playback_pcm_ops = {
 	.open = eie_ppcm_open,
 	.close = eie_ppcm_close,
@@ -562,7 +646,17 @@ static struct snd_pcm_ops eie_capture_pcm_ops = {
 	.mmap = snd_pcm_lib_mmap_vmalloc,
 };
 
+static struct snd_rawmidi_ops eie_midi_out_ops = {
+	.open = eie_mout_open,
+	.close = eie_mout_close,
+	.trigger = eie_mout_trigger,
+};
 
+static struct snd_rawmidi_ops eie_midi_in_ops = {
+	.open = eie_min_open,
+	.close = eie_min_close,
+	.trigger = eie_min_trigger,
+};
 
 static void abort_playback(struct eie *eie)
 {
@@ -717,6 +811,33 @@ static void cap_urb_complete(struct urb *urb)
 		abort_playback(eie);
 }
 
+static void min_urb_complete(struct urb *urb)
+{
+	struct eie *eie = urb->context;
+	int i, err;
+
+	if (urb->status != 0) {
+		dev_dbg(&eie->udev->dev, "Midi in urb complete. %d", urb->status);
+		return;
+	}
+
+	if (test_bit(MIN_UP, &eie->states))
+		for (i = 0; i < urb->actual_length; i++) {
+			__u8 b = ((__u8*)urb->transfer_buffer)[i];
+			if (b != 0xfd)
+				snd_rawmidi_receive(eie->min_substream, &b, 1);
+		}
+
+	err = usb_submit_urb(urb, GFP_ATOMIC);
+	if (err < 0) {
+		dev_err(&eie->udev->dev, "Cannot resubmit midi-in urb.");
+	}
+}
+
+static void mout_urb_complete(struct urb *urb)
+{
+}
+
 static void kill_all_urbs(struct eie *eie)
 {
 	struct urb *urb;
@@ -739,7 +860,6 @@ static void kill_all_urbs(struct eie *eie)
 		if (urb)
 			usb_kill_urb(urb);
 	}
-
 }
 
 static void kill_and_free_urb(struct eie *eie, struct urb **urbp)
@@ -771,6 +891,12 @@ static void free_usb_related_resources(struct eie *eie)
 	for (i = 0; i < CAP_URB_CNT; i++)
 		kill_and_free_urb(eie, &eie->cap_urbs[i]);
 
+	for (i = 0; i < MIN_URB_CNT; i++)
+		kill_and_free_urb(eie, &eie->min_urbs[i]);
+
+	for (i = 0; i < MOUT_URB_CNT; i++)
+		kill_and_free_urb(eie, &eie->mout_urbs[i]);
+
 	if (eie->ifb) {
 		usb_set_intfdata(eie->ifb, NULL);
 		usb_driver_release_interface(&eie_driver, eie->ifb);
@@ -780,6 +906,255 @@ static void free_usb_related_resources(struct eie *eie)
 		usb_set_intfdata(eie->ifa, NULL);
 }
 
+
+static int init_play_urbs(struct eie *eie,
+	struct usb_endpoint_descriptor *endpoint)
+{
+	unsigned char *buf;
+	struct urb *urb;
+	int j;
+	int err = 0;
+
+	eie->play_packet_size = usb_endpoint_maxp(endpoint);
+	eie->play_endpointAddr = endpoint->bEndpointAddress;
+
+	for (j = 0; j < PLAY_URB_CNT; j++) {
+		urb = usb_alloc_urb(PLAY_PKT_CNT, GFP_KERNEL);
+		if (urb == NULL) {
+			err = -ENOMEM;
+			break;
+		}
+
+		buf = usb_alloc_coherent(eie->udev,
+			PLAY_PKT_CNT * eie->play_packet_size,
+			GFP_KERNEL, &urb->transfer_dma);
+		if (buf == NULL) {
+			usb_free_urb(urb);
+			err = -ENOMEM;
+			break;
+		}
+
+		urb->dev = eie->udev;
+		urb->pipe = usb_sndisocpipe(eie->udev, eie->play_endpointAddr);
+		urb->transfer_flags = URB_NO_TRANSFER_DMA_MAP;
+		urb->transfer_buffer = buf;
+		/* urb->transfer_dma - set from usb_alloc_coherent */
+		urb->transfer_buffer_length = PLAY_PKT_CNT * eie->play_packet_size;
+		urb->number_of_packets = PLAY_PKT_CNT;
+		urb->interval = 1;
+		urb->context = &eie->play_urbs[j];
+		urb->complete = play_urb_complete;
+
+		eie->play_urbs[j].urb = urb;
+		eie->play_urbs[j].eie = eie;
+	}
+
+	return err;
+}
+
+static int init_sync_urbs(struct eie *eie,
+	struct usb_endpoint_descriptor *endpoint)
+{
+	unsigned char *buf;
+	struct urb *urb;
+	int j;
+	int err = 0;
+
+	eie->sync_packet_size = usb_endpoint_maxp(endpoint);
+	eie->sync_endpointAddr = endpoint->bEndpointAddress;
+
+	for (j = 0; j < SYNC_URB_CNT; j++) {
+		urb = usb_alloc_urb(1, GFP_KERNEL);
+		if (urb == NULL) {
+			err = -ENOMEM;
+			break;
+		}
+
+		buf = usb_alloc_coherent(eie->udev, eie->sync_packet_size,
+			GFP_KERNEL, &urb->transfer_dma);
+		if (buf == NULL) {
+			usb_free_urb(urb);
+			err = -ENOMEM;
+			break;
+		}
+
+		urb->dev = eie->udev;
+		urb->pipe = usb_rcvisocpipe(eie->udev, eie->sync_endpointAddr);
+		urb->transfer_flags = URB_NO_TRANSFER_DMA_MAP;
+		urb->transfer_buffer = buf;
+		/* urb->transfer_dma - set from usb_alloc_coherent */
+		urb->transfer_buffer_length = eie->sync_packet_size;
+		urb->number_of_packets = 1;
+		urb->interval = 1;
+		urb->context = eie;
+		urb->complete = sync_urb_complete;
+		urb->iso_frame_desc[0].offset = 0;
+		urb->iso_frame_desc[0].length = eie->sync_packet_size;
+
+		eie->sync_urbs[j] = urb;
+	}
+
+	return err;
+}
+
+
+static int init_cap_urbs(struct eie *eie,
+	struct usb_endpoint_descriptor *endpoint)
+{
+	unsigned char *buf;
+	struct urb *urb;
+	int j;
+	int err = 0;
+
+	eie->cap_endpointAddr = endpoint->bEndpointAddress;
+	for (j = 0; j < CAP_URB_CNT; j++) {
+		urb = usb_alloc_urb(0, GFP_KERNEL);
+		if (urb == NULL) {
+			err = -ENOMEM;
+			break;
+		}
+
+		buf = usb_alloc_coherent(eie->udev, usb_endpoint_maxp(endpoint),
+			GFP_KERNEL, &urb->transfer_dma);
+		if (buf == NULL) {
+			usb_free_urb(urb);
+			err = -ENOMEM;
+			break;
+		}
+
+		usb_fill_bulk_urb(urb, eie->udev,
+			usb_rcvbulkpipe(eie->udev, eie->cap_endpointAddr), buf,
+			usb_endpoint_maxp(endpoint), cap_urb_complete, eie);
+
+		eie->cap_urbs[j] = urb;
+	}
+
+	return err;
+}
+
+static int init_mout_urbs(struct eie *eie,
+	struct usb_endpoint_descriptor *endpoint)
+{
+	unsigned char *buf;
+	struct urb *urb;
+	int j;
+	int err = 0;
+
+	eie->mout_endpointAddr = endpoint->bEndpointAddress;
+	for (j = 0; j < MOUT_URB_CNT; j++) {
+		urb = usb_alloc_urb(0, GFP_KERNEL);
+		if (urb == NULL) {
+			err = -ENOMEM;
+			break;
+		}
+
+		buf = usb_alloc_coherent(eie->udev, usb_endpoint_maxp(endpoint),
+			GFP_KERNEL, &urb->transfer_dma);
+		if (buf == NULL) {
+			usb_free_urb(urb);
+			err = -ENOMEM;
+			break;
+		}
+
+		usb_fill_bulk_urb(urb, eie->udev,
+			usb_sndbulkpipe(eie->udev, eie->mout_endpointAddr), buf,
+			usb_endpoint_maxp(endpoint), mout_urb_complete, eie);
+
+		eie->mout_urbs[j] = urb;
+	}
+
+	return err;
+}
+
+static int init_min_urbs(struct eie *eie,
+	struct usb_endpoint_descriptor *endpoint)
+{
+	unsigned char *buf;
+	struct urb *urb;
+	int j;
+	int err = 0;
+
+	eie->min_endpointAddr = endpoint->bEndpointAddress;
+	for (j = 0; j < MIN_URB_CNT; j++) {
+		urb = usb_alloc_urb(0, GFP_KERNEL);
+		if (urb == NULL) {
+			err = -ENOMEM;
+			break;
+		}
+
+		buf = usb_alloc_coherent(eie->udev, usb_endpoint_maxp(endpoint),
+			GFP_KERNEL, &urb->transfer_dma);
+		if (buf == NULL) {
+			usb_free_urb(urb);
+			err = -ENOMEM;
+			break;
+		}
+
+		usb_fill_bulk_urb(urb, eie->udev,
+			usb_rcvbulkpipe(eie->udev, eie->min_endpointAddr), buf,
+			usb_endpoint_maxp(endpoint), min_urb_complete, eie);
+
+		eie->min_urbs[j] = urb;
+	}
+
+	return err;
+}
+
+static int init_urbs(struct eie *eie)
+{
+	int i, err;
+
+	struct usb_host_interface *iface_desc;
+	struct usb_endpoint_descriptor *endpoint;
+
+	iface_desc = eie->ifa->cur_altsetting;
+	for (i = 0; i < iface_desc->desc.bNumEndpoints; i++) {
+		endpoint = &iface_desc->endpoint[i].desc;
+
+		if (!eie->play_endpointAddr && usb_endpoint_is_isoc_out(endpoint)) {
+			err = init_play_urbs(eie, endpoint);
+			if (err < 0)
+				return err;
+		}
+		if (!eie->mout_endpointAddr && usb_endpoint_is_bulk_out(endpoint)) {
+			err = init_mout_urbs(eie, endpoint);
+			if (err < 0)
+				return err;
+		}
+		if (!eie->min_endpointAddr && usb_endpoint_is_bulk_in(endpoint)) {
+			err = init_min_urbs(eie, endpoint);
+			if (err < 0)
+				return err;
+		}
+	}
+
+	iface_desc = eie->ifb->cur_altsetting;
+	for (i = 0; i < iface_desc->desc.bNumEndpoints; i++) {
+		endpoint = &iface_desc->endpoint[i].desc;
+
+		if (!eie->sync_endpointAddr && usb_endpoint_is_isoc_in(endpoint)) {
+			err = init_sync_urbs(eie, endpoint);
+			if (err < 0)
+				return err;
+		}
+
+		if (!eie->cap_endpointAddr && usb_endpoint_is_bulk_in(endpoint)) {
+			err = init_cap_urbs(eie, endpoint);
+			if (err < 0)
+				return err;
+		}
+	}
+
+	if (!(eie->cap_endpointAddr && eie->play_endpointAddr
+		&& eie->mout_endpointAddr && eie->min_endpointAddr
+		&& eie->sync_endpointAddr)) {
+		dev_err(&eie->udev->dev, "Cannot find expected endpoints.");
+		return -ENOENT;
+	}
+
+	return 0;
+}
+
 static int eie_probe(struct usb_interface *interface,
 	const struct usb_device_id *usb_id)
 {
@@ -787,16 +1162,12 @@ static int eie_probe(struct usb_interface *interface,
 
 	unsigned int card_index;
 	struct snd_card *card;
+	struct snd_rawmidi *rmidi;
 	struct eie *eie;
 
 	char usb_path[32];
-	struct usb_host_interface *iface_desc;
-	struct usb_endpoint_descriptor *endpoint;
-	struct urb *urb;
-	unsigned char *buf;
 
 	int err;
-	int i, j;
 
 	mutex_lock(&devices_mutex);
 
@@ -840,109 +1211,6 @@ static int eie_probe(struct usb_interface *interface,
 	if (err < 0)
 		goto probe_err;
 
-	iface_desc = eie->ifa->cur_altsetting;
-	for (i = 0; i < iface_desc->desc.bNumEndpoints; i++) {
-		endpoint = &iface_desc->endpoint[i].desc;
-
-		if (!eie->play_endpointAddr && usb_endpoint_is_isoc_out(endpoint)) {
-			eie->play_packet_size = usb_endpoint_maxp(endpoint);
-			eie->play_endpointAddr = endpoint->bEndpointAddress;
-			for (j = 0; j < PLAY_URB_CNT; j++) {
-				urb = usb_alloc_urb(PLAY_PKT_CNT, GFP_KERNEL);
-				if (urb == NULL) {
-					err = -ENOMEM;
-					goto probe_err;
-				}
-
-				eie->play_urbs[j].urb = urb;
-				eie->play_urbs[j].eie = eie;
-
-				buf = usb_alloc_coherent(eie->udev,
-					PLAY_PKT_CNT * eie->play_packet_size,
-					GFP_KERNEL, &urb->transfer_dma);
-				if (buf == NULL) {
-					err = -ENOMEM;
-					goto probe_err;
-				}
-
-				urb->dev = eie->udev;
-				urb->pipe = usb_sndisocpipe(eie->udev, eie->play_endpointAddr);
-				urb->transfer_flags = URB_NO_TRANSFER_DMA_MAP;
-				urb->transfer_buffer = buf;
-				/* urb->transfer_dma - set from usb_alloc_coherent */
-				urb->transfer_buffer_length = PLAY_PKT_CNT * eie->play_packet_size;
-				urb->number_of_packets = PLAY_PKT_CNT;
-				urb->interval = 1;
-				urb->context = &eie->play_urbs[i];
-				urb->complete = play_urb_complete;
-			}
-		}
-	}
-
-	iface_desc = eie->ifb->cur_altsetting;
-	for (i = 0; i < iface_desc->desc.bNumEndpoints; i++) {
-		endpoint = &iface_desc->endpoint[i].desc;
-
-		if (!eie->sync_endpointAddr && usb_endpoint_is_isoc_in(endpoint)) {
-			eie->sync_packet_size = usb_endpoint_maxp(endpoint);
-			eie->sync_endpointAddr = endpoint->bEndpointAddress;
-			for (j = 0; j < SYNC_URB_CNT; j++) {
-				urb = usb_alloc_urb(1, GFP_KERNEL);
-				if (urb == NULL) {
-					err = -ENOMEM;
-					goto probe_err;
-				}
-				eie->sync_urbs[j] = urb;
-
-				buf = usb_alloc_coherent(eie->udev, eie->sync_packet_size,
-					GFP_KERNEL, &urb->transfer_dma);
-				if (buf == NULL) {
-					err = -ENOMEM;
-					goto probe_err;
-				}
-
-				urb->dev = eie->udev;
-				urb->pipe = usb_rcvisocpipe(eie->udev, eie->sync_endpointAddr);
-				urb->transfer_flags = URB_NO_TRANSFER_DMA_MAP;
-				urb->transfer_buffer = buf;
-				/* urb->transfer_dma - set from usb_alloc_coherent */
-				urb->transfer_buffer_length = eie->sync_packet_size;
-				urb->number_of_packets = 1;
-				urb->interval = 1;
-				urb->context = eie;
-				urb->complete = sync_urb_complete;
-				urb->iso_frame_desc[0].offset = 0;
-				urb->iso_frame_desc[0].length = eie->sync_packet_size;
-			}
-		}
-
-		if (!eie->cap_endpointAddr && usb_endpoint_is_bulk_in(endpoint)) {
-			eie->cap_endpointAddr = endpoint->bEndpointAddress;
-			for (j = 0; j < CAP_URB_CNT; j++) {
-				urb = usb_alloc_urb(0, GFP_KERNEL);
-				if (urb == NULL) {
-					err = -ENOMEM;
-					goto probe_err;
-				}
-				eie->cap_urbs[j] = urb;
-
-				buf = usb_alloc_coherent(eie->udev, usb_endpoint_maxp(endpoint),
-					GFP_KERNEL, &urb->transfer_dma);
-				if (buf == NULL) {
-					err = -ENOMEM;
-					goto probe_err;
-				}
-
-				usb_fill_bulk_urb(urb, eie->udev, usb_rcvbulkpipe(eie->udev, eie->cap_endpointAddr), buf, usb_endpoint_maxp(endpoint), cap_urb_complete, eie);
-			}
-
-		}
-	}
-
-	if (!eie->sync_endpointAddr || !eie->play_endpointAddr) {
-		dev_err(&eie->udev->dev, "Cannot find expected endpoints.");
-		goto probe_err;
-	}
 
 	/* prepare the card struct */
 	snd_card_set_dev(card, &interface->dev);
@@ -963,9 +1231,25 @@ static int eie_probe(struct usb_interface *interface,
 	snd_pcm_set_ops(eie->pcm, SNDRV_PCM_STREAM_PLAYBACK, &eie_playback_pcm_ops);
 	snd_pcm_set_ops(eie->pcm, SNDRV_PCM_STREAM_CAPTURE, &eie_capture_pcm_ops);
 
+	err = snd_rawmidi_new(card, "eiepro", 0, 1, 1, &rmidi);
+	if (err < 0)
+		goto probe_err;
+	rmidi->private_data = eie;
+	strcpy(rmidi->name, "EIE pro");
+	rmidi->info_flags = SNDRV_RAWMIDI_INFO_OUTPUT |
+	SNDRV_RAWMIDI_INFO_INPUT |
+	SNDRV_RAWMIDI_INFO_DUPLEX;
+
+	snd_rawmidi_set_ops(rmidi, SNDRV_RAWMIDI_STREAM_OUTPUT, &eie_midi_out_ops);
+	snd_rawmidi_set_ops(rmidi, SNDRV_RAWMIDI_STREAM_INPUT, &eie_midi_in_ops);
+
+	eie->rmidi = rmidi;
+
 	err = snd_card_register(card);
 	if (err < 0)
 		goto probe_err;
+
+	init_urbs(eie);
 
 	usb_set_intfdata(interface, eie);
 	devices_used |= 1 << card_index;
