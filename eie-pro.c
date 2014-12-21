@@ -101,6 +101,7 @@ struct eie {
 	__u8 mout_endpointAddr;
 	struct urb *min_urbs[MIN_URB_CNT];
 	struct urb *mout_urbs[MOUT_URB_CNT];
+	unsigned long submitted_mout_urbs;
 	struct snd_rawmidi_substream *min_substream;
 	struct snd_rawmidi_substream *mout_substream;
 };
@@ -611,13 +612,53 @@ static int eie_mout_open(struct snd_rawmidi_substream *substream)
 
 static int eie_mout_close(struct snd_rawmidi_substream *substream)
 {
-	// struct eie *eie = substream->rmidi->private_data;
+	int i;
+	struct eie *eie = substream->rmidi->private_data;
+
+	for (i = 0; i < MOUT_URB_CNT; i++)
+		usb_kill_urb(eie->mout_urbs[i]);
+
 	return 0;
 }
 
 static void eie_mout_trigger(struct snd_rawmidi_substream *substream, int up)
 {
-	// struct eie *eie = substream->rmidi->private_data;
+	int i, urb_idx, err;
+	struct eie *eie = substream->rmidi->private_data;
+	struct urb *urb = NULL;
+
+	if (up <= 0) {
+		return;
+	}
+
+	for (i = 0; i < MOUT_URB_CNT; i++) {
+		if (test_and_set_bit(i, &eie->submitted_mout_urbs) == 0) {
+			urb = eie->mout_urbs[i];
+			urb_idx = i;
+			break;
+		}
+	}
+
+	// no free URB
+	if (urb == NULL)
+		return;
+
+	err = snd_rawmidi_transmit(substream, urb->transfer_buffer, 3);
+	if (err <= 0) {
+		clear_bit(urb_idx, &eie->submitted_mout_urbs);
+		return;
+	}
+	for (i = err; i < 8; i++) {
+		((char*) urb->transfer_buffer)[i] = 0xfd;
+	}
+	((char*) urb->transfer_buffer)[8] = 0xe0;
+	urb->transfer_buffer_length = 9;
+
+	err = usb_submit_urb(urb, GFP_ATOMIC);
+	if (err < 0) {
+		clear_bit(urb_idx, &eie->submitted_mout_urbs);
+		dev_err(&eie->udev->dev, "Cannot submit midi-out urb.");
+	}
 }
 
 static struct snd_pcm_ops eie_playback_pcm_ops = {
@@ -829,13 +870,24 @@ static void min_urb_complete(struct urb *urb)
 		}
 
 	err = usb_submit_urb(urb, GFP_ATOMIC);
-	if (err < 0) {
+	if (err < 0)
 		dev_err(&eie->udev->dev, "Cannot resubmit midi-in urb.");
-	}
 }
 
 static void mout_urb_complete(struct urb *urb)
 {
+	struct eie *eie = urb->context;
+	int i;
+
+	if (urb->status != 0)
+		dev_dbg(&eie->udev->dev, "Midi out urb complete. %d", urb->status);
+
+	for (i = 0; i < MOUT_URB_CNT; i++) {
+		if (eie->mout_urbs[i] == urb) {
+			clear_bit(i, &eie->submitted_mout_urbs);
+			break;
+		}
+	}
 }
 
 static void kill_all_urbs(struct eie *eie)
@@ -1293,10 +1345,10 @@ static struct usb_driver eie_driver = {
 	.id_table = eie_ids,
 	.probe = eie_probe,
 	.disconnect = eie_disconnect,
-#if 0
+/*
 	.suspend = eie_suspend,
 	.resume = eie_resume,
-#endif
+*/
 };
 
 module_usb_driver(eie_driver);
