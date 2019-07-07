@@ -1,4 +1,4 @@
-#eie-pro-linux
+# eie-pro-linux
 
 Linux driver for Akai EIE Pro sound interface. The current development status
 is highly experimental.
