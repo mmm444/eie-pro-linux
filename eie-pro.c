@@ -2,6 +2,7 @@
 #include <linux/module.h>
 #include <linux/wait.h>
 #include <linux/usb.h>
+#include <linux/slab.h>
 
 #include <sound/core.h>
 #include <sound/initval.h>
@@ -278,9 +279,13 @@ static struct magic_seq magic_seq2[] = {
 	{0, 0, 0, 0, 0}
 };
 
-static int send_magic_sequence(struct eie *eie, struct magic_seq *m, void *data)
+#define MAX_MAGIC_SEQ_LENGTH 5 /* enough to fit any magic sequence buffer */
+
+static int send_magic_sequence(struct eie *eie, struct magic_seq *m, char *data)
 {
 	int err;
+
+	WARN_ON(m->size > MAX_MAGIC_SEQ_LENGTH);
 
 	while (m->type != 0) {
 		unsigned int p = m->type & 0x80 ? usb_rcvctrlpipe(eie->udev, 0)
@@ -304,9 +309,12 @@ static int send_magic_sequence(struct eie *eie, struct magic_seq *m, void *data)
 
 static int reset_eie(struct eie *eie, unsigned int rate)
 {
-	int err;
-	unsigned char data[6];
+	int err = 0;
+	unsigned char *data;
 
+	data = kmalloc(MAX_MAGIC_SEQ_LENGTH, GFP_KERNEL);
+	if (!data)
+		return -ENOMEM;
 
 	dev_dbg(&eie->udev->dev, "Resetting device");
 	kill_all_urbs(eie);
@@ -316,7 +324,7 @@ static int reset_eie(struct eie *eie, unsigned int rate)
 
 	err = send_magic_sequence(eie, &magic_seq1[0], data);
 	if (err < 0)
-		return err;
+		goto out;
 
 	*((__le32 *) data) = __cpu_to_le32(rate);
 	dev_dbg(&eie->udev->dev, "rate: %d data: %02hhx %02hhx %02hhx",
@@ -324,7 +332,7 @@ static int reset_eie(struct eie *eie, unsigned int rate)
 
 	err = send_magic_sequence(eie, &magic_seq2[0], data);
 	if (err < 0)
-		return err;
+		goto out;
 
 	dev_dbg(&eie->udev->dev, "Completed magic initialization sequence.");
 
@@ -332,15 +340,17 @@ static int reset_eie(struct eie *eie, unsigned int rate)
 
 	err = submit_init_sync_urbs(eie);
 	if (err < 0)
-		return err;
+		goto out;
 
 	err = submit_init_play_urbs(eie);
 	if (err < 0)
-		return err;
+		goto out;
 
 	wait_event(eie->urbs_flow_wait, test_bit(URBS_FLOWING, &eie->states));
 
-	return 0;
+out:
+	kfree(data);
+	return err;
 }
 
 static int eie_ppcm_prepare(struct snd_pcm_substream *substream)
@@ -671,7 +681,6 @@ static struct snd_pcm_ops eie_playback_pcm_ops = {
 	.trigger = eie_ppcm_trigger,
 	.pointer = eie_ppcm_pointer,
 	.page = snd_pcm_lib_get_vmalloc_page,
-	.mmap = snd_pcm_lib_mmap_vmalloc,
 };
 
 static struct snd_pcm_ops eie_capture_pcm_ops = {
@@ -684,7 +693,6 @@ static struct snd_pcm_ops eie_capture_pcm_ops = {
 	.trigger = eie_cpcm_trigger,
 	.pointer = eie_cpcm_pointer,
 	.page = snd_pcm_lib_get_vmalloc_page,
-	.mmap = snd_pcm_lib_mmap_vmalloc,
 };
 
 static struct snd_rawmidi_ops eie_midi_out_ops = {
