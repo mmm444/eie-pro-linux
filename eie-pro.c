@@ -13,7 +13,6 @@
 MODULE_DESCRIPTION("Akai EIE pro driver");
 MODULE_AUTHOR("Michal Rydlo <michal.rydlo@gmail.com>");
 MODULE_LICENSE("GPL v2");
-MODULE_SUPPORTED_DEVICE("{{Akai,EIE pro}}");
 
 static int index[SNDRV_CARDS] = SNDRV_DEFAULT_IDX;
 static char *id[SNDRV_CARDS] = SNDRV_DEFAULT_STR;
