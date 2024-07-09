@@ -17,5 +17,8 @@ clean:
 test:
 	-sudo rmmod eie_pro
 	sudo insmod eie-pro.ko dyndbg==pmft
-	-timeout 8 aplay -v -Dsysdefault:CARD=pro /usr/share/sounds/alsa/Front_Center.wav
+	-timeout 8 aplay -vv -Dsysdefault:CARD=pro /usr/share/sounds/alsa/Front_Center.wav
+
+check:
+	$(KERNELDIR)/scripts/checkpatch.pl --no-tree --file eie-pro.c
 endif

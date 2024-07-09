@@ -1,7 +1,7 @@
 *.o
 *.ko
-*.mod.*
-*o.cmd
+*.mod*
+*.cmd
 Module.symvers
 modules.order
 .tmp_versions/
