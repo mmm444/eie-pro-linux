@@ -839,18 +839,17 @@ static void cap_urb_complete(struct urb *urb)
 			eie->cap_buf_pos++;
 			eie->cap_buf_pos %= runtime->buffer_size;
 
-			/* TODO: this is broken: negative shifts are undefined in C */
-			/* TODO: calculate in platform order & convert to LE once */
-			out[0] = 0;
-			out[1] = 0;
-			out[2] = 0;
-			out[3] = 0;
+			ch1 = ch2 = ch3 = ch4 = 0;
 			for (j = 0; j < 24; j++) {
-				out[0] |= __cpu_to_le32((buf[64*i + j +  0] & 1) << (31-j));
-				out[1] |= __cpu_to_le32((buf[64*i + j + 32] & 1) << (31-j));
-				out[2] |= __cpu_to_le32((buf[64*i + j +  0] & 2) << (30-j));
-				out[3] |= __cpu_to_le32((buf[64*i + j + 32] & 2) << (30-j));
+				ch1 |= (buf[64*i + j +  0]        & 1) << (23-j);
+				ch2 |= (buf[64*i + j + 32]        & 1) << (23-j);
+				ch3 |= ((buf[64*i + j +  0] >> 1) & 1) << (23-j);
+				ch4 |= ((buf[64*i + j + 32] >> 1) & 1) << (23-j);
 			}
+			out[0] = __cpu_to_le32(ch1);
+			out[1] = __cpu_to_le32(ch2);
+			out[2] = __cpu_to_le32(ch3);
+			out[3] = __cpu_to_le32(ch4);
 		}
 
 		eie->cap_frames += frames_rcvd;
