@@ -5,6 +5,8 @@
 #include <linux/wait.h>
 #include <linux/usb.h>
 #include <linux/slab.h>
+#include <linux/vmalloc.h>
+#include <linux/version.h>
 
 #include <sound/core.h>
 #include <sound/initval.h>
@@ -200,14 +202,45 @@ static int eie_cpcm_close(struct snd_pcm_substream *substream)
 static int eie_pcm_hw_params(struct snd_pcm_substream *substream,
 	struct snd_pcm_hw_params *hw_params)
 {
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 12, 0)
 	return snd_pcm_lib_alloc_vmalloc_buffer(substream,
 		params_buffer_bytes(hw_params));
+#else
+	struct snd_pcm_runtime *runtime = substream->runtime;
+	size_t size = params_buffer_bytes(hw_params);
+
+	/* Allocate the PCM runtime buffer, which is exposed to userspace. */
+	if (runtime->dma_area) {
+		if (runtime->dma_bytes >= size)
+			return 0; /* already large enough */
+		vfree(runtime->dma_area);
+	}
+	runtime->dma_area = vzalloc(size);
+	if (!runtime->dma_area)
+		return -ENOMEM;
+	runtime->dma_bytes = size;
+	return 1;
+#endif
 }
 
 static int eie_pcm_hw_free(struct snd_pcm_substream *substream)
 {
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 12, 0)
 	return snd_pcm_lib_free_vmalloc_buffer(substream);
+#else
+	struct snd_pcm_runtime *runtime = substream->runtime;
+
+	vfree(runtime->dma_area);
+	runtime->dma_area = NULL;
+	return 0;
 }
+
+static struct page *eie_get_page(struct snd_pcm_substream *substream,
+	unsigned long offset)
+{
+	return vmalloc_to_page(substream->runtime->dma_area + offset);
+}
+#endif
 
 static const char *usb_error_string(int err)
 {
@@ -685,7 +718,11 @@ static const struct snd_pcm_ops eie_playback_pcm_ops = {
 	.prepare = eie_ppcm_prepare,
 	.trigger = eie_ppcm_trigger,
 	.pointer = eie_ppcm_pointer,
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 12, 0)
 	.page = snd_pcm_lib_get_vmalloc_page,
+#else
+	.page = eie_get_page,
+#endif
 };
 
 static const struct snd_pcm_ops eie_capture_pcm_ops = {
@@ -697,7 +734,11 @@ static const struct snd_pcm_ops eie_capture_pcm_ops = {
 	.prepare = eie_cpcm_prepare,
 	.trigger = eie_cpcm_trigger,
 	.pointer = eie_cpcm_pointer,
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 12, 0)
 	.page = snd_pcm_lib_get_vmalloc_page,
+#else
+	.page = eie_get_page,
+#endif
 };
 
 static const struct snd_rawmidi_ops eie_midi_out_ops = {
