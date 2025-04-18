@@ -9,10 +9,24 @@ else
 	PWD := $(shell pwd)
 
 default:
-	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules
+	$(MAKE) -C $(KERNELDIR) M=$(PWD) CC=$(CC) CFLAGS='$(CFLAGS)' LDFLAGS='$(LDFLAGS)' modules
+
+install: default
+	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules_install
+	depmod -a
+
+live: install
+	modprobe eie_pro
+
+uninstall:
+	modprobe -r eie_pro
+	rm /lib/modules/$(shell uname -r)/updates/eie-pro.ko
+	depmod -a
 
 clean:
 	$(MAKE) -C $(KERNELDIR) M=$(PWD) clean
+
+cleanup: | uninstall clean
 
 test:
 	-sudo rmmod eie_pro
@@ -20,5 +34,5 @@ test:
 	-timeout 8 aplay -vv -Dsysdefault:CARD=pro /usr/share/sounds/alsa/Front_Center.wav
 
 check:
-	$(KERNELDIR)/scripts/checkpatch.pl --no-tree --file eie-pro.c
+	/lib/modules/$(shell uname -r)/source/scripts/checkpatch.pl --no-tree --file eie-pro.c
 endif
